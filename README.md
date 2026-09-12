@@ -1,1 +1,0 @@
-# adv-xai-industrial-defect
