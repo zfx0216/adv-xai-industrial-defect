@@ -1,0 +1,211 @@
+import os
+import sys
+import json
+import torch
+import torch.nn as nn
+from torchvision import transforms, datasets
+import torch.optim as optim
+from tqdm import tqdm
+from torchvision.models import densenet121
+import matplotlib.pyplot as plt
+from torch.utils.data import DataLoader
+import numpy as np
+import csv
+
+def evaluate_model(model, dataloader, device):
+    model.eval()
+    total_samples, correct_predictions = 0, 0
+
+    with torch.no_grad():
+        for images, labels in tqdm(dataloader, desc="Evaluating", unit="batch"):
+            images, labels = images.to(device), labels.to(device)
+            outputs = model(images)
+            predictions = torch.argmax(outputs, dim=1)
+            correct_predictions += (predictions == labels).sum().item()
+            total_samples += labels.size(0)
+
+    accuracy = (correct_predictions / total_samples) * 100 if total_samples > 0 else 0
+    return accuracy, correct_predictions, total_samples
+
+def main():
+    loss_sequence = []
+    acc_sequence = []
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    print("using {} device.".format(device))
+
+    data_transform = {
+        # "train": transforms.Compose([
+        #     transforms.Resize((224, 224)),
+        #     transforms.ToTensor(),
+        #     transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
+        # ]),
+        "train":transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.RandomHorizontalFlip(),
+            # transforms.RandomVerticalFlip(),
+            transforms.RandomRotation(5),
+            transforms.ToTensor(),
+            transforms.Normalize((0.485, 0.456, 0.406),
+                                 (0.229, 0.224, 0.225))
+        ]),
+        "test": transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
+        ])
+    }
+
+    # Set the model name
+    model_name = 'densenet121'
+    save_path = r'F:\IndustrialInspectionCode\weights\PGD_adversarially_trained_models\NEU-DET\densenet121'
+
+    # Load the training dataset
+    train_dataset = datasets.ImageFolder(
+        root=r"F:\IndustrialInspectionCode\adversarial_training_data\densenet121\NEU-DET\train",
+        transform=data_transform["train"]
+    )
+    train_num = len(train_dataset)
+
+    classes_list = train_dataset.class_to_idx
+    cla_dict = dict((val, key) for key, val in classes_list.items())
+    print(cla_dict)
+    with open(os.path.join(save_path, 'class_indices.json'), 'w') as json_file:
+        json_file.write(json.dumps(cla_dict, indent=4))
+
+    batch_size = 16
+    nw = min([os.cpu_count(), batch_size if batch_size > 1 else 0, 8])
+    print('Using {} dataloader workers every process'.format(nw))
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=nw
+    )
+
+    test_dataset = datasets.ImageFolder(
+        root=r"F:\IndustrialInspectionCode\original_data\NEU-DET\test",
+        transform=data_transform["test"]
+    )
+    test_num = len(test_dataset)
+    test_loader = torch.utils.data.DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=nw,
+        pin_memory=True if str(device) == 'cuda:0' else False
+    )
+
+    test_classes_list = test_dataset.class_to_idx
+    if test_classes_list != classes_list:
+        print("Warning: the training and test sets have different classes!")
+        print("Training classes: ", classes_list)
+        print("Test classes: ", test_classes_list)
+
+    net = densenet121(num_classes=1000)
+    pretrained_weights_path = r"E:\Desktop\weight_1000\densenet121_true.pth"
+    state_dict = torch.load(pretrained_weights_path, map_location=device, weights_only=True)
+    net.load_state_dict(state_dict)
+
+    num_features = net.classifier.in_features
+    net.classifier = nn.Linear(num_features, 6)
+    net.to(device)
+
+    loss_function = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(net.parameters(), lr=0.0001)
+
+    # scheduler_step = optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.1)
+    scheduler_plateau = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode='min',
+        factor=0.1,
+        patience=3,
+        verbose=True,
+        min_lr=1e-6
+    )
+
+    epochs = 30
+    best_loss = float('inf')
+    best_acc = 0.0
+    best_loss_model_path = os.path.join(save_path, f'{model_name}_best_loss.pth')
+    best_acc_model_path = os.path.join(save_path, f'{model_name}_best_acc.pth')
+
+    # ===================== Create log file =====================
+    log_file = os.path.join(save_path, "train_log.csv")
+    with open(log_file, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow(["Epoch", "Train_Loss", "Test_Accuracy"])
+    # ======================================================
+
+    for epoch in range(epochs):
+        net.train()
+        running_loss = 0.0
+        train_bar = tqdm(train_loader, file=sys.stdout)
+
+        for step, data in enumerate(train_bar):
+            images, labels = data
+            optimizer.zero_grad()
+            outputs = net(images.to(device))
+            loss = loss_function(outputs, labels.to(device))
+            loss.backward()
+            optimizer.step()
+
+            running_loss += loss.item()
+            train_bar.desc = "train epoch[{}/{}] loss:{:.3f} lr:{:.6f}".format(
+                epoch + 1, epochs, loss, optimizer.param_groups[0]['lr']
+            )
+
+        epoch_loss = running_loss / len(train_loader)
+        loss_sequence.append(epoch_loss)
+        print('[epoch %d] train_loss: %.3f  lr: %.6f' %
+              (epoch + 1, epoch_loss, optimizer.param_groups[0]['lr']))
+
+        test_accuracy, test_correct, test_total = evaluate_model(net, test_loader, device)
+        acc_sequence.append(test_accuracy)
+        print(f'[epoch {epoch + 1}] test_accuracy: {test_accuracy:.2f}% ({test_correct}/{test_total})')
+
+        # scheduler_step.step()
+        scheduler_plateau.step(epoch_loss)
+
+        # Save the best model based on loss
+        if epoch_loss <= best_loss:
+            best_loss = epoch_loss
+            torch.save(net.state_dict(), best_loss_model_path)
+            print(f"New best loss model saved at epoch {epoch + 1} with loss {best_loss:.4f}")
+
+        # Save the best model based on test accuracy
+        if test_accuracy >= best_acc:
+            best_acc = test_accuracy
+            torch.save(net.state_dict(), best_acc_model_path)
+            print(f"New best accuracy model saved at epoch {epoch + 1} with test accuracy {best_acc:.2f}%")
+
+        # ===================== Write to the log each epoch =====================
+        with open(log_file, 'a', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow([epoch + 1, round(epoch_loss, 4), round(test_accuracy, 2)])
+        # ======================================================
+
+        # Plot loss and accuracy curves
+        fig, ax1 = plt.subplots()
+        ax1.set_xlabel('Epoch')
+        ax1.set_ylabel('Loss', color='tab:blue')
+        ax1.plot(range(len(loss_sequence)), loss_sequence, marker='o', color='tab:blue', label='Train Loss')
+        ax1.tick_params(axis='y', labelcolor='tab:blue')
+
+        ax2 = ax1.twinx()
+        ax2.set_ylabel('Test Accuracy (%)', color='tab:orange')
+        ax2.plot(range(len(acc_sequence)), acc_sequence, marker='s', color='tab:orange', label='Test Accuracy')
+        ax2.tick_params(axis='y', labelcolor='tab:orange')
+
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2, labels1 + labels2, loc='center right')
+
+        plt.title('Training Loss and Test Accuracy')
+        plt.savefig(os.path.join(save_path, 'loss_acc_plot.png'))
+        plt.close()
+
+    print('Finished Training')
+    del net
+
+if __name__ == '__main__':
+    main()
